@@ -31,7 +31,8 @@ type config struct {
 	// debug, when true, writes details to logs.
 	debug bool
 
-	// lambda, when true, enables the lambda trace writer
+	// logToStdout reports whether we should log all traces to the standard
+	// output instead of using the agent. This is used in Lambda environments.
 	logToStdout bool
 
 	// logStartup, when true, causes various startup info to be written
@@ -200,7 +201,7 @@ func newConfig(opts ...StartOption) *config {
 		}
 	}
 	if c.transport == nil {
-		c.transport = newTransport(c.agentAddr, c.httpClient)
+		c.transport = newHTTPTransport(c.agentAddr, c.httpClient)
 	}
 	if c.propagator == nil {
 		c.propagator = NewPropagator(nil)

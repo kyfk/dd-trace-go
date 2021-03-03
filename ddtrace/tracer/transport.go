@@ -6,6 +6,7 @@
 package tracer
 
 import (
+	"bytes"
 	"fmt"
 	"io"
 	"net"
@@ -14,8 +15,10 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/tinylib/msgp/msgp"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/version"
 )
@@ -53,13 +56,34 @@ const (
 	traceCountHeader   = "X-Datadog-Trace-Count" // header containing the number of traces in the payload
 )
 
-// transport is an interface for span submission to the agent.
+// transport is an interface for communicating data to the agent.
 type transport interface {
 	// send sends the payload p to the agent using the transport set up.
 	// It returns a non-nil response body when no error occurred.
 	send(p *payload) (body io.ReadCloser, err error)
+	// sendStats sends the given stats payload to the agent.
+	sendStats(s *statsPayload) error
 	// endpoint returns the URL to which the transport will send traces.
 	endpoint() string
+	// onFlush specifies the function to use to retrieve the state of the
+	// tracer upon flushing.
+	onFlush(fn func() state)
+}
+
+type httpTransport struct {
+	traceURL string            // the delivery URL for traces
+	statsURL string            // the delivery URL for stats
+	client   *http.Client      // the HTTP client used in the POST
+	headers  map[string]string // the Transport headers
+
+	mu        sync.RWMutex
+	onFlushFn func() state
+}
+
+type state struct {
+	clientStats     bool
+	droppedP0Traces uint64
+	droppedP0Spans  uint64
 }
 
 // newTransport returns a new Transport implementation that sends traces to a
@@ -72,26 +96,10 @@ type transport interface {
 // running on a non-default port, if it's located on another machine, or when
 // otherwise needing to customize the transport layer, for instance when using
 // a unix domain socket.
-func newTransport(addr string, client *http.Client) transport {
+func newHTTPTransport(addr string, client *http.Client) *httpTransport {
 	if client == nil {
 		client = defaultClient
 	}
-	return newHTTPTransport(addr, client)
-}
-
-// newDefaultTransport return a default transport for this tracing client
-func newDefaultTransport() transport {
-	return newHTTPTransport(defaultAddress, defaultClient)
-}
-
-type httpTransport struct {
-	traceURL string            // the delivery URL for traces
-	client   *http.Client      // the HTTP client used in the POST
-	headers  map[string]string // the Transport headers
-}
-
-// newHTTPTransport returns an httpTransport for the given endpoint
-func newHTTPTransport(addr string, client *http.Client) *httpTransport {
 	// initialize the default EncoderPool with Encoder headers
 	defaultHeaders := map[string]string{
 		"Datadog-Meta-Lang":             "go",
@@ -105,9 +113,54 @@ func newHTTPTransport(addr string, client *http.Client) *httpTransport {
 	}
 	return &httpTransport{
 		traceURL: fmt.Sprintf("http://%s/v0.4/traces", resolveAddr(addr)),
+		statsURL: fmt.Sprintf("http://%s/v0.5/stats", resolveAddr(addr)),
 		client:   client,
 		headers:  defaultHeaders,
 	}
+}
+
+func (t *httpTransport) onFlush(fn func() state) {
+	t.mu.Lock()
+	t.onFlushFn = fn
+	t.mu.Unlock()
+}
+
+func (t *httpTransport) sendStats(p *statsPayload) error {
+	var buf bytes.Buffer
+	if err := msgp.Encode(&buf, p); err != nil {
+		return err
+	}
+	req, err := http.NewRequest("POST", t.statsURL, &buf)
+	if err != nil {
+		return err
+	}
+	resp, err := t.client.Do(req)
+	if err != nil {
+		return err
+	}
+	if code := resp.StatusCode; code >= 400 {
+		// error, check the body for context information and
+		// return a nice error.
+		msg := make([]byte, 1000)
+		n, _ := resp.Body.Read(msg)
+		resp.Body.Close()
+		txt := http.StatusText(code)
+		if n > 0 {
+			return fmt.Errorf("%s (Status: %s)", msg[:n], txt)
+		}
+		return fmt.Errorf("%s", txt)
+	}
+	return nil
+}
+
+func (t *httpTransport) state() state {
+	t.mu.RLock()
+	defer t.mu.RUnlock()
+	if t.onFlushFn == nil {
+		return state{}
+	}
+	state := t.onFlushFn()
+	return state
 }
 
 func (t *httpTransport) send(p *payload) (body io.ReadCloser, err error) {
@@ -121,6 +174,14 @@ func (t *httpTransport) send(p *payload) (body io.ReadCloser, err error) {
 	req.Header.Set(traceCountHeader, strconv.Itoa(p.itemCount()))
 	req.Header.Set("Content-Length", strconv.Itoa(p.size()))
 	req.Header.Set(headerComputedTopLevel, "yes")
+	state := t.state()
+	if state.clientStats {
+		req.Header.Set("Datadog-Client-Computed-Stats", "yes")
+	}
+	if state.droppedP0Traces > 0 || state.droppedP0Spans > 0 {
+		req.Header.Set("Datadog-Client-Dropped-P0-Traces", strconv.Itoa(int(state.droppedP0Traces)))
+		req.Header.Set("Datadog-Client-Dropped-P0-Spans", strconv.Itoa(int(state.droppedP0Spans)))
+	}
 	response, err := t.client.Do(req)
 	if err != nil {
 		return nil, err
