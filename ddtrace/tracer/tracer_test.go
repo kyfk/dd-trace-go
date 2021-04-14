@@ -1261,8 +1261,6 @@ func (t *dummyTransport) Len() int {
 	return len(t.traces)
 }
 
-func (t *dummyTransport) onFlush(_ func() state) {}
-
 func (t *dummyTransport) sendStats(p *statsPayload) error {
 	t.Lock()
 	t.stats = append(t.stats, p)

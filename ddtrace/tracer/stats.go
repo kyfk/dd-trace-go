@@ -31,8 +31,9 @@ type aggregableSpan struct {
 	TopLevel        bool
 }
 
-// bucketSize specifies the size of a stats bucket.
-var bucketSize = (10 * time.Second).Nanoseconds()
+// defaultStatsBucketSize specifies the default span of time that will be
+// covered in one stats bucket.
+var defaultStatsBucketSize = (10 * time.Second).Nanoseconds()
 
 // concentrator aggregates and stores statistics on incoming spans in time buckets,
 // flushing them occasionally to the underlying transport located in the given
@@ -53,32 +54,35 @@ type concentrator struct {
 	// stopped reports whether the concentrator is stopped (when non-zero)
 	stopped uint64
 
-	wg        sync.WaitGroup // waits for any active goroutines
-	bufferLen int            // maximum number of buckets buffered
-	oldestTs  int64          // any entry older than this will go into this bucket
-	stop      chan struct{}  // closing this channel triggers shutdown
-	cfg       *config        // tracer startup configuration
+	wg         sync.WaitGroup // waits for any active goroutines
+	bufferLen  int            // maximum number of buckets buffered
+	bucketSize int64          // the size of a bucket in nanoseconds
+	oldestTs   int64          // any entry older than this will go into this bucket
+	stop       chan struct{}  // closing this channel triggers shutdown
+	cfg        *config        // tracer startup configuration
 }
 
 // defaultBufferLen represents the default buffer length; the number of bucket size
 // units used by the concentrator.
 const defaultBufferLen = 2
 
-// newConcentrator creates a new concentrator using the given tracer configuration c.
-func newConcentrator(c *config) *concentrator {
+// newConcentrator creates a new concentrator using the given tracer
+// configuration c. It creates buckets of bucketSize nanoseconds duration.
+func newConcentrator(c *config, bucketSize int64) *concentrator {
 	return &concentrator{
-		In:        make(chan *aggregableSpan, 10000),
-		bufferLen: defaultBufferLen,
-		stopped:   1,
-		oldestTs:  alignTs(time.Now().UnixNano()),
-		buckets:   make(map[int64]*rawBucket),
-		cfg:       c,
+		In:         make(chan *aggregableSpan, 10000),
+		bufferLen:  defaultBufferLen,
+		bucketSize: bucketSize,
+		stopped:    1,
+		oldestTs:   alignTs(time.Now().UnixNano(), bucketSize),
+		buckets:    make(map[int64]*rawBucket),
+		cfg:        c,
 	}
 }
 
 // alignTs returns the provided timestamp truncated to the bucket size.
 // It gives us the start time of the time bucket in which such timestamp falls.
-func alignTs(ts int64) int64 { return ts - ts%bucketSize }
+func alignTs(ts, bucketSize int64) int64 { return ts - ts%bucketSize }
 
 // Start starts the concentrator. A started concentrator needs to be stopped
 // in order to gracefully shut down, using Stop.
@@ -91,7 +95,7 @@ func (c *concentrator) Start() {
 	c.wg.Add(1)
 	go func() {
 		defer c.wg.Done()
-		tick := time.NewTicker(time.Duration(bucketSize) * time.Nanosecond)
+		tick := time.NewTicker(time.Duration(c.bucketSize) * time.Nanosecond)
 		defer tick.Stop()
 		c.runFlusher(tick.C)
 	}()
@@ -139,13 +143,13 @@ func (c *concentrator) add(ss *aggregableSpan) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	btime := alignTs(ss.Start + ss.Duration)
+	btime := alignTs(ss.Start+ss.Duration, c.bucketSize)
 	if btime < c.oldestTs {
 		btime = c.oldestTs
 	}
 	b, ok := c.buckets[btime]
 	if !ok {
-		b = newRawBucket(uint64(btime))
+		b = newRawBucket(uint64(btime), c.bucketSize)
 		c.buckets[btime] = b
 	}
 	b.handleSpan(ss)
@@ -172,7 +176,7 @@ func (c *concentrator) flush(timenow time.Time) statsPayload {
 		Stats:    make([]statsBucket, 0, len(c.buckets)),
 	}
 	for ts, srb := range c.buckets {
-		if ts > now-int64(c.bufferLen)*bucketSize {
+		if ts > now-int64(c.bufferLen)*c.bucketSize {
 			// Always make sure that we keep the most recent bufferLen number of buckets.
 			// This is a trade-off: we accept slightly late traces (clock skew and stuff)
 			// but we delay flushing by at most bufferLen buckets.
@@ -184,7 +188,7 @@ func (c *concentrator) flush(timenow time.Time) statsPayload {
 	}
 	// After flushing, update the oldest timestamp allowed to prevent having stats for
 	// an already-flushed bucket.
-	newOldestTs := alignTs(now) - int64(c.bufferLen-1)*bucketSize
+	newOldestTs := alignTs(now, c.bucketSize) - int64(c.bufferLen-1)*c.bucketSize
 	if newOldestTs > c.oldestTs {
 		log.Debug("Update oldestTs to %d", newOldestTs)
 		c.oldestTs = newOldestTs
@@ -211,10 +215,10 @@ type rawBucket struct {
 	data            map[aggregation]*rawGroupedStats
 }
 
-func newRawBucket(btime uint64) *rawBucket {
+func newRawBucket(btime uint64, bsize int64) *rawBucket {
 	return &rawBucket{
 		start:    btime,
-		duration: uint64(bucketSize),
+		duration: uint64(bsize),
 		data:     make(map[aggregation]*rawGroupedStats),
 	}
 }

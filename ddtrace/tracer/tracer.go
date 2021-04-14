@@ -12,7 +12,6 @@ import (
 	"os"
 	"strconv"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gopkg.in/DataDog/dd-trace-go.v1/ddtrace"
@@ -178,7 +177,7 @@ func newUnstartedTracer(opts ...StartOption) *tracer {
 		prioritySampling: sampler,
 		pid:              strconv.Itoa(os.Getpid()),
 		features:         &agentFeatures{},
-		stats:            newConcentrator(c),
+		stats:            newConcentrator(c, defaultStatsBucketSize),
 	}
 	return t
 }
@@ -250,7 +249,7 @@ type agentFeatures struct {
 	V05 bool
 
 	// Stats reports whether the agent can receive client-computed stats on
-	// the /v0.5/stats endpoint.
+	// the /v0.6/stats endpoint.
 	Stats bool
 }
 
@@ -301,20 +300,13 @@ func (t *tracer) loadAgentFeatures() {
 	f := agentFeatures{DropP0s: info.ClientDropP0s}
 	for _, endpoint := range info.Endpoints {
 		switch endpoint {
-		case "/v0.5/stats":
+		case "/v0.6/stats":
 			f.Stats = true
 		case "/v0.5/traces":
 			f.V05 = true
 		}
 	}
 	t.features.Store(f)
-	t.config.transport.onFlush(func() state {
-		return state{
-			clientStats:     f.Stats,
-			droppedP0Traces: atomic.SwapUint64(&t.droppedP0Traces, 0),
-			droppedP0Spans:  atomic.SwapUint64(&t.droppedP0Spans, 0),
-		}
-	})
 }
 
 // worker receives finished traces to be added into the payload, as well
