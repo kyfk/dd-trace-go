@@ -16,6 +16,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/log"
 
+	"github.com/DataDog/datadog-go/statsd"
 	"github.com/DataDog/sketches-go/ddsketch"
 )
 
@@ -116,7 +117,10 @@ func (c *concentrator) runFlusher(tick <-chan time.Time) {
 				// nothing to flush
 				continue
 			}
+			c.statsd().Incr("datadog.tracer.stats.flush_payloads", nil, 1)
+			c.statsd().Incr("datadog.tracer.stats.flush_buckets", nil, float64(len(p.Stats)))
 			if err := c.cfg.transport.sendStats(&p); err != nil {
+				c.statsd().Incr("datadog.tracer.stats.flush_errors", nil, 1)
 				log.Error("Error sending stats payload: %v", err)
 			}
 		case <-c.stop:
@@ -125,12 +129,21 @@ func (c *concentrator) runFlusher(tick <-chan time.Time) {
 	}
 }
 
+// statsd returns any tracer configured statsd client, or a no-op.
+func (c *concentrator) statsd() statsdClient {
+	if c.cfg.statsd == nil {
+		return &statsd.NoOpClient{}
+	}
+	return c.cfg.statsd
+}
+
 // runIngester runs the loop which accepts incoming data on the concentrator's In
 // channel.
 func (c *concentrator) runIngester() {
 	for {
 		select {
 		case ss := <-c.In:
+			c.statsd().Incr("datadog.tracer.stats.spans_in", nil, 1)
 			c.add(ss)
 		case <-c.stop:
 			return
