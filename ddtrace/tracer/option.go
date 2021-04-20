@@ -31,6 +31,10 @@ type config struct {
 	// debug, when true, writes details to logs.
 	debug bool
 
+	// discovery reports whether the tracer should react to the agent's
+	// /info endpoint (and drop p0's, compute stats, etc when available)
+	discovery bool
+
 	// logToStdout reports whether we should log all traces to the standard
 	// output instead of using the agent. This is used in Lambda environments.
 	logToStdout bool
@@ -133,6 +137,9 @@ func newConfig(opts ...StartOption) *config {
 	}
 	if v := os.Getenv("DD_ENV"); v != "" {
 		c.env = v
+	}
+	if internal.BoolEnv("DD_TRACE_DISCOVERY", false) {
+		WithDiscovery()(c)
 	}
 	if v := os.Getenv("DD_SERVICE"); v != "" {
 		c.serviceName = v
@@ -245,6 +252,13 @@ func statsTags(c *config) []string {
 		}
 	}
 	return tags
+}
+
+// WithDiscovery sets logger as the tracer's error printer.
+func WithDiscovery() StartOption {
+	return func(c *config) {
+		c.discovery = true
+	}
 }
 
 // WithLogger sets logger as the tracer's error printer.

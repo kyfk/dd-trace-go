@@ -403,7 +403,7 @@ func shouldDrop(s *span) bool {
 		return false
 	}
 	if v, ok := s.Metrics[ext.EventSampleRate]; ok {
-		return sampledByRate(s.TraceID, v)
+		return !sampledByRate(s.TraceID, v)
 	}
 	return true
 }
